@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              ultimate-custom-tray-fork
-// @name            Ultimate Custom Tray - Fork
+// @id              ultimate-custom-tray
+// @name            Ultimate Custom Tray
 // @description     Custom tray icons with actions, context menus and image icon support.
 // @version         1.0
 // @author          Salyts
