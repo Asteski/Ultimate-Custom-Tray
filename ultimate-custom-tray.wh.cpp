@@ -2,7 +2,7 @@
 // @id              ultimate-custom-tray
 // @name            Ultimate Custom Tray
 // @description     Custom tray icons with actions, context menus and image icon support.
-// @version         1.0
+// @version         1.0.1
 // @author          Salyts
 // @license         MIT
 // @github          https://github.com/Salyts
@@ -38,8 +38,13 @@ Actions run on **left-click** (or from a context menu item).
 | `~` | `~Downloads` | Opens a folder or file by name. |
 | `cmd:` | `cmd:control` | Runs a command through `cmd.exe`. |
 | `shell:` | `shell:shutdown /r /f /t 0` | Runs through `powershell.exe`. |
+| `key:` / `hotkey:` | `key:Ctrl+Shift+Esc` | Simulates a keyboard shortcut with virtual key presses. |
 | `web:` | `web:https://windhawk.net/` | Opens a URL in the default browser. |
 | `ms-settings:` | `ms-settings:bluetooth` | Opens a Windows Settings page. |
+
+For shortcut actions, use `Modifier+Modifier+Key`.
+Supported modifiers: `Ctrl`, `Alt`, `Shift`, `Win`.
+Examples: `key:Ctrl+Alt+D`, `hotkey:Win+R`, `key:0x7B` (F12 by VK code).
 
 ---
 
@@ -119,6 +124,8 @@ Each tray icon can show a right-click context menu.
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <unordered_map>
+#include <string_view>
 
 struct ContextMenuItem {
     std::wstring name;
@@ -297,6 +304,149 @@ static bool GetKnownFolderPath(const wchar_t* name, std::wstring& out) {
     return ok;
 }
 
+static bool TryParseShortcut(std::wstring_view shortcut,
+                             UINT* modifiersOut,
+                             UINT* vkOut) {
+    auto trim = [](std::wstring_view s) {
+        size_t start = 0;
+        while (start < s.size() && iswspace(s[start])) start++;
+
+        size_t end = s.size();
+        while (end > start && iswspace(s[end - 1])) end--;
+
+        return s.substr(start, end - start);
+    };
+
+    std::unordered_map<std::wstring, UINT> modifiersMap = {
+        {L"ALT", MOD_ALT},
+        {L"CTRL", MOD_CONTROL},
+        {L"CONTROL", MOD_CONTROL},
+        {L"SHIFT", MOD_SHIFT},
+        {L"WIN", MOD_WIN},
+    };
+
+    std::unordered_map<std::wstring, UINT> vkMap = {
+        {L"TAB", VK_TAB},
+        {L"ENTER", VK_RETURN},
+        {L"RETURN", VK_RETURN},
+        {L"SPACE", VK_SPACE},
+        {L"ESC", VK_ESCAPE},
+        {L"ESCAPE", VK_ESCAPE},
+        {L"BACKSPACE", VK_BACK},
+        {L"HOME", VK_HOME},
+        {L"END", VK_END},
+        {L"PAGEUP", VK_PRIOR},
+        {L"PAGEDOWN", VK_NEXT},
+        {L"INSERT", VK_INSERT},
+        {L"DELETE", VK_DELETE},
+        {L"LEFT", VK_LEFT},
+        {L"RIGHT", VK_RIGHT},
+        {L"UP", VK_UP},
+        {L"DOWN", VK_DOWN},
+        {L"NUMLOCK", VK_NUMLOCK},
+        {L"VOLUMEMUTE", VK_VOLUME_MUTE},
+        {L"VOLUMEUP", VK_VOLUME_UP},
+        {L"VOLUMEDOWN", VK_VOLUME_DOWN},
+        {L"MEDIAPLAYPAUSE", VK_MEDIA_PLAY_PAUSE},
+        {L"MEDIANEXT", VK_MEDIA_NEXT_TRACK},
+        {L"MEDIAPREV", VK_MEDIA_PREV_TRACK},
+        {L"MEDIASTOP", VK_MEDIA_STOP},
+    };
+
+    UINT modifiers = 0;
+    UINT vk = 0;
+    size_t start = 0;
+
+    while (start <= shortcut.size()) {
+        size_t plus = shortcut.find(L'+', start);
+        std::wstring_view part = plus == std::wstring_view::npos
+            ? shortcut.substr(start)
+            : shortcut.substr(start, plus - start);
+        part = trim(part);
+
+        if (part.empty()) return false;
+
+        std::wstring token(part);
+        for (auto& ch : token) ch = (wchar_t)towupper(ch);
+
+        auto modIt = modifiersMap.find(token);
+        if (modIt != modifiersMap.end()) {
+            modifiers |= modIt->second;
+        } else {
+            if (vk != 0) return false;
+
+            if (token.size() == 1 && token[0] >= L'A' && token[0] <= L'Z') {
+                vk = (UINT)token[0];
+            } else if (token.size() == 1 && token[0] >= L'0' && token[0] <= L'9') {
+                vk = (UINT)token[0];
+            } else if (token.size() >= 2 && token[0] == L'F') {
+                int fn = _wtoi(token.c_str() + 1);
+                if (fn >= 1 && fn <= 24) {
+                    vk = VK_F1 + (UINT)(fn - 1);
+                } else {
+                    return false;
+                }
+            } else if (token.rfind(L"NUMPAD", 0) == 0 && token.size() == 7 &&
+                       token[6] >= L'0' && token[6] <= L'9') {
+                vk = VK_NUMPAD0 + (UINT)(token[6] - L'0');
+            } else {
+                auto vkIt = vkMap.find(token);
+                if (vkIt != vkMap.end()) {
+                    vk = vkIt->second;
+                } else {
+                    size_t pos = 0;
+                    try {
+                        unsigned long parsed = std::stoul(token, &pos, 0);
+                        if (pos != token.size() || parsed == 0 || parsed > 0xFF)
+                            return false;
+                        vk = (UINT)parsed;
+                    } catch (...) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if (plus == std::wstring_view::npos) break;
+        start = plus + 1;
+    }
+
+    if (vk == 0) return false;
+
+    *modifiersOut = modifiers;
+    *vkOut = vk;
+    return true;
+}
+
+static bool SendShortcut(UINT modifiers, UINT vk) {
+    std::vector<INPUT> inputs;
+    inputs.reserve(10);
+
+    auto addKey = [&inputs](WORD key, DWORD flags) {
+        INPUT in = {};
+        in.type = INPUT_KEYBOARD;
+        in.ki.wVk = key;
+        in.ki.dwFlags = flags;
+        inputs.push_back(in);
+    };
+
+    if (modifiers & MOD_CONTROL) addKey(VK_CONTROL, 0);
+    if (modifiers & MOD_SHIFT)   addKey(VK_SHIFT, 0);
+    if (modifiers & MOD_ALT)     addKey(VK_MENU, 0);
+    if (modifiers & MOD_WIN)     addKey(VK_LWIN, 0);
+
+    addKey((WORD)vk, 0);
+    addKey((WORD)vk, KEYEVENTF_KEYUP);
+
+    if (modifiers & MOD_WIN)     addKey(VK_LWIN, KEYEVENTF_KEYUP);
+    if (modifiers & MOD_ALT)     addKey(VK_MENU, KEYEVENTF_KEYUP);
+    if (modifiers & MOD_SHIFT)   addKey(VK_SHIFT, KEYEVENTF_KEYUP);
+    if (modifiers & MOD_CONTROL) addKey(VK_CONTROL, KEYEVENTF_KEYUP);
+
+    UINT sent = SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+    return sent == inputs.size();
+}
+
 static void ExecuteAction(const std::wstring& raw) {
     if (raw.empty()) return;
 
@@ -324,6 +474,23 @@ static void ExecuteAction(const std::wstring& raw) {
                 L"-NoProfile -ExecutionPolicy Bypass -Command " + a.substr(6);
             ShellExecuteW(nullptr, L"open", L"powershell.exe",
                           arg.c_str(), nullptr, SW_HIDE);
+            return;
+        }
+        if (StartsWithCI(a, L"key:") || StartsWithCI(a, L"hotkey:")) {
+            std::wstring shortcut = StartsWithCI(a, L"key:")
+                ? a.substr(4)
+                : a.substr(7);
+
+            UINT modifiers = 0;
+            UINT vk = 0;
+            if (!TryParseShortcut(shortcut, &modifiers, &vk)) {
+                Wh_Log(L"Invalid shortcut action: %s", shortcut.c_str());
+                return;
+            }
+
+            if (!SendShortcut(modifiers, vk)) {
+                Wh_Log(L"Failed to send shortcut: %s", shortcut.c_str());
+            }
             return;
         }
         if (!a.empty() && a.front() == L'~') {
